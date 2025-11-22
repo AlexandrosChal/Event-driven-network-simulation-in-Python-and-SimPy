@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 # --- 1. Παράμετροι Προσομοίωσης ---
 
 # Bandwidth σε bits ανά δευτερόλεπτο (bps). 1 Mbps = 1,000,000 bps.
-BANDWIDTH_BPS = 1_000_000
+BANDWIDTH_BPS = 100_000_000
 # Μετατροπή σε bytes/sec
 BANDWIDTH_BYTES_PER_SEC = BANDWIDTH_BPS / 8
 
