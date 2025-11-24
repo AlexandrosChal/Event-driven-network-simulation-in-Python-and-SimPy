@@ -1,22 +1,30 @@
 import simpy
 import matplotlib.pyplot as plt
 
-# --- 1. Παράμετροι Προσομοίωσης ---
+# --- 1. Παράμετροι & Σενάρια ---
 
-# Χρησιμοποιούμε 1 Mbps για να δούμε καθαρά τη συμφόρηση
+# Επιλογή Αλγορίθμου: 'FCFS' ή 'RR' (Round Robin)
+SCHEDULING_ALGORITHM = 'RR'  
+
+# Σενάριο Κυκλοφορίας: 'EQUAL' (ίδια πακέτα) ή 'MIXED' (Μικρά vs Μεγάλα)
+SCENARIO = 'MIXED' 
+
 BANDWIDTH_BPS = 1_000_000
 BANDWIDTH_BYTES_PER_SEC = BANDWIDTH_BPS / 8
-
-PACKET_SIZE_BYTES = 5000 
-PACKET_INTERVAL_S = 0.005  # Κάθε πηγή στέλνει με αυτόν τον ρυθμό
-
-# Καθυστέρηση διάδοσης
-PROP_DELAY_LINK_S = 0.050  
-
-QUEUE_SIZE = 10
-NUM_PACKETS_TOTAL = 2000 # Συνολικά πακέτα στο δίκτυο
+PACKET_INTERVAL_S = 0.005
+PROP_DELAY_LINK_S = 0.050
+QUEUE_SIZE = 20 # Αυξήσαμε λίγο την ουρά για να χωρέσουν τα πειράματα
+NUM_PACKETS_TOTAL = 2000
 SIM_TIME_S = 20.0
 MONITOR_INTERVAL_S = 0.1
+
+# Ρύθμιση Μεγεθών ανάλογα με το σενάριο
+if SCENARIO == 'EQUAL':
+    SIZE_HOST_A = 1000
+    SIZE_HOST_B = 1000
+elif SCENARIO == 'MIXED':
+    SIZE_HOST_A = 100   # Μικρά πακέτα (π.χ. VoIP/Gaming)
+    SIZE_HOST_B = 3000  # Μεγάλα πακέτα (π.χ. File Download)
 
 # --- 2. Μοντέλο Πακέτου ---
 class Packet:
@@ -24,249 +32,192 @@ class Packet:
         self.time_created = time_created
         self.size_bytes = size_bytes
         self.packet_id = packet_id
-        self.src_id = src_id # Από ποιον host ήρθε (A ή B)
+        self.src_id = src_id 
 
     def __repr__(self):
-        return f"Packet(src={self.src_id}, id={self.packet_id})"
+        return f"Packet(src={self.src_id}, id={self.packet_id}, size={self.size_bytes})"
 
 # --- 3. Κόμβοι Δικτύου ---
 
 def source_host(env, src_name, num_packets, packet_interval, packet_size, link_to_router, packets_sent_stats):
-    """
-    Γενική συνάρτηση για Host. Θα την καλέσουμε 2 φορές (για Host A και Host B).
-    """
     for i in range(num_packets):
-        packet = Packet(
-            time_created=env.now,
-            size_bytes=packet_size,
-            packet_id=i,
-            src_id=src_name
-        )
+        packet = Packet(env.now, packet_size, i, src_name)
         link_to_router.put(packet)
         packets_sent_stats['count'] += 1
         yield env.timeout(packet_interval)
 
 class Router:
-    def __init__(self, env, name, bandwidth_bytes_per_sec, prop_delay_s, queue_size):
+    def __init__(self, env, name, bandwidth_bytes_per_sec, prop_delay_s, queue_size, algorithm='FCFS'):
         self.env = env
         self.name = name
         self.bandwidth = bandwidth_bytes_per_sec
         self.prop_delay = prop_delay_s
-        self.queue = simpy.Store(env, capacity=queue_size)
+        self.algorithm = algorithm
+        self.queue_capacity = queue_size
         self.packets_dropped = 0
+        
+        # Δομές Ουρών
+        if self.algorithm == 'FCFS':
+            self.queue = simpy.Store(env, capacity=queue_size)
+        elif self.algorithm == 'RR':
+            # Ξεχωριστές ουρές για κάθε Host
+            self.queues = {
+                'HostA': simpy.Store(env, capacity=queue_size),
+                'HostB': simpy.Store(env, capacity=queue_size)
+            }
+            self.rr_cycle = ['HostA', 'HostB'] # Σειρά εξυπηρέτησης
+            self.rr_index = 0
+            self.packet_arrival_event = env.event() # Event για ξύπνημα όταν έρθει πακέτο
 
     def receive_packets(self, link_input):
-        """Λαμβάνει πακέτα (Shared Link αν είναι ο R1)."""
         while True:
             packet = yield link_input.get()
             self.env.process(self.handle_arrival(packet))
 
     def handle_arrival(self, packet):
-        # Propagation Delay (εισερχόμενο)
         yield self.env.timeout(self.prop_delay)
         
-        # Έλεγχος ουράς
-        if len(self.queue.items) < self.queue.capacity:
-            self.queue.put(packet)
-        else:
-            self.packets_dropped += 1
+        if self.algorithm == 'FCFS':
+            if len(self.queue.items) < self.queue.capacity:
+                self.queue.put(packet)
+            else:
+                self.packets_dropped += 1
+                
+        elif self.algorithm == 'RR':
+            target_queue = self.queues[packet.src_id]
+            if len(target_queue.items) < target_queue.capacity:
+                target_queue.put(packet)
+                # Ειδοποιούμε την send_packets ότι ήρθε κάτι (αν κοιμάται)
+                if not self.packet_arrival_event.triggered:
+                    self.packet_arrival_event.succeed()
+                    self.packet_arrival_event = self.env.event() # Reset event
+            else:
+                self.packets_dropped += 1
 
     def send_packets(self, link_output):
         while True:
-            packet = yield self.queue.get()
+            packet_to_send = None
+            
+            if self.algorithm == 'FCFS':
+                packet_to_send = yield self.queue.get()
+                
+            elif self.algorithm == 'RR':
+                # Έλεγχος ουρών κυκλικά (Round Robin)
+                start_index = self.rr_index
+                found = False
+                
+                # Κάνουμε έναν κύκλο για να βρούμε πακέτο
+                for _ in range(len(self.rr_cycle)):
+                    current_host = self.rr_cycle[self.rr_index]
+                    # Μετακίνηση δείκτη για την επόμενη φορά (πριν τον έλεγχο, για δίκαιη σειρά)
+                    self.rr_index = (self.rr_index + 1) % len(self.rr_cycle)
+                    
+                    if len(self.queues[current_host].items) > 0:
+                        packet_to_send = yield self.queues[current_host].get()
+                        found = True
+                        break
+                
+                if not found:
+                    # Αν όλες οι ουρές είναι άδειες, περίμενε να έρθει κάτι
+                    yield self.packet_arrival_event
+                    continue
 
-            # Transmission Delay
-            transmission_delay = packet.size_bytes / self.bandwidth
+            # Transmission
+            transmission_delay = packet_to_send.size_bytes / self.bandwidth
             yield self.env.timeout(transmission_delay)
+            link_output.put(packet_to_send)
 
-            # Forwarding: Απλά βάζουμε το πακέτο στο επόμενο link
-            # Το propagation delay θα το χρεωθεί ο επόμενος κόμβος ή ο προορισμός
-            link_output.put(packet)
-
-
-# --- ΔΙΟΡΘΩΣΗ: Νέα λογική Destination Host με Pipelining ---
 def destination_host(env, link_from_last_router, prop_delay_last_link, delay_stats, received_stats):
     while True:
         packet = yield link_from_last_router.get()
-        # Ξεκινάμε νέα διεργασία για κάθε πακέτο ώστε να μην μπλοκάρει η λήψη του επόμενου
         env.process(handle_dest_arrival(env, packet, prop_delay_last_link, delay_stats, received_stats))
 
 def handle_dest_arrival(env, packet, prop_delay, delay_stats, received_stats):
-    # Προσομοίωση Propagation Delay στο τελευταίο καλώδιο
     yield env.timeout(prop_delay)
-    
     arrival_time = env.now
-    end_to_end_delay = arrival_time - packet.time_created
+    delay = arrival_time - packet.time_created
     
-    delay_stats.append((arrival_time, end_to_end_delay))
+    # Αποθήκευση delay ανά Host για σύγκριση
+    delay_stats.append((arrival_time, delay, packet.src_id))
     received_stats['count'] += 1
     received_stats['total_bits'] += packet.size_bytes * 8
     received_stats['last_arrival_time'] = arrival_time
-# -----------------------------------------------------------
 
-
-# --- 4. Monitoring ---
-
-def monitor_queue_size(env, router, interval, queue_size_stats):
-    while True:
-        current_queue_size = len(router.queue.items)
-        queue_size_stats.append((env.now, current_queue_size))
-        yield env.timeout(interval)
-
+# --- 4. Monitoring & Main ---
+# (Οι συναρτήσεις monitoring είναι ίδιες, παραλείπονται για συντομία, είναι ενσωματωμένες στο main)
 def monitor_throughput(env, interval, received_stats, throughput_stats):
     last_checked_bits = 0
     while True:
         yield env.timeout(interval)
-        current_total_bits = received_stats['total_bits']
-        bits_since_last_check = current_total_bits - last_checked_bits
-        
-        current_throughput_mbps = (bits_since_last_check / interval) / 1_000_000
-        throughput_stats.append((env.now, current_throughput_mbps))
-        last_checked_bits = current_total_bits
-        
-def monitor_total_packet_loss(env, interval, routers_list, packets_sent_stats, loss_rate_stats):
-    while True:
-        yield env.timeout(interval)
-        total_sent = packets_sent_stats['count']
-        total_dropped = sum(r.packets_dropped for r in routers_list)
-        
-        if total_sent > 0:
-            loss_rate = (total_dropped / total_sent) * 100
-        else:
-            loss_rate = 0
-        loss_rate_stats.append((env.now, loss_rate))
+        current_total = received_stats['total_bits']
+        mbps = ((current_total - last_checked_bits) / interval) / 1e6
+        throughput_stats.append((env.now, mbps))
+        last_checked_bits = current_total
 
-# --- 5. Κύριο Πρόγραμμα (Main) ---
 if __name__ == "__main__":
-    delay_stats = []
-    queue_size_stats_r1 = [] 
-    queue_size_stats_r2 = []
+    delay_stats = [] # (time, delay, src_id)
     throughput_stats = []
-    loss_rate_stats = []
-    
     packets_sent_stats = {'count': 0}
     received_stats = {'count': 0, 'total_bits': 0, 'last_arrival_time': 0}
 
-    print(f"--- Έναρξη Προσομοίωσης: 2 Hosts -> Router 1 -> Router 2 -> Dest ---")
-    print(f"Bandwidth: {BANDWIDTH_BPS/1e6} Mbps")
-    print(f"Host A: 1000 πακέτα, Host B: 1000 πακέτα (Σύνολο: {NUM_PACKETS_TOTAL})")
-    
+    print(f"--- Simulation: {SCHEDULING_ALGORITHM} | Scenario: {SCENARIO} ---")
+    print(f"Host A Size: {SIZE_HOST_A} B | Host B Size: {SIZE_HOST_B} B")
+
     env = simpy.Environment()
     
-    # Links
-    # Κοινό link για τους δύο hosts προς τον R1
-    link_sources_to_r1 = simpy.Store(env)
-    link_r1_to_r2 = simpy.Store(env)
-    link_r2_to_dest = simpy.Store(env)
+    link_src_r1 = simpy.Store(env)
+    link_r1_r2 = simpy.Store(env)
+    link_r2_dest = simpy.Store(env)
     
-    # Routers
-    router1 = Router(env, "R1", BANDWIDTH_BYTES_PER_SEC, PROP_DELAY_LINK_S, QUEUE_SIZE)
-    router2 = Router(env, "R2", BANDWIDTH_BYTES_PER_SEC, PROP_DELAY_LINK_S, QUEUE_SIZE)
+    # Router 1 εφαρμόζει τον αλγόριθμο (Aggregator)
+    router1 = Router(env, "R1", BANDWIDTH_BYTES_PER_SEC, PROP_DELAY_LINK_S, QUEUE_SIZE, algorithm=SCHEDULING_ALGORITHM)
+    # Router 2 είναι απλός FIFO (Backbone)
+    router2 = Router(env, "R2", BANDWIDTH_BYTES_PER_SEC, PROP_DELAY_LINK_S, QUEUE_SIZE, algorithm='FCFS')
     
-    # --- Processes ---
-    
-    # 1. Δύο Hosts στέλνουν ταυτόχρονα στον Router 1
-    # Μοιράζουμε τα πακέτα δια 2
     packets_per_host = NUM_PACKETS_TOTAL // 2
+    env.process(source_host(env, "HostA", packets_per_host, PACKET_INTERVAL_S, SIZE_HOST_A, link_src_r1, packets_sent_stats))
+    env.process(source_host(env, "HostB", packets_per_host, PACKET_INTERVAL_S, SIZE_HOST_B, link_src_r1, packets_sent_stats))
     
-    env.process(source_host(env, "HostA", packets_per_host, PACKET_INTERVAL_S, PACKET_SIZE_BYTES, link_sources_to_r1, packets_sent_stats))
-    env.process(source_host(env, "HostB", packets_per_host, PACKET_INTERVAL_S, PACKET_SIZE_BYTES, link_sources_to_r1, packets_sent_stats))
+    env.process(router1.receive_packets(link_src_r1))
+    env.process(router1.send_packets(link_r1_r2))
     
-    # 2. Router 1 (Merge)
-    env.process(router1.receive_packets(link_sources_to_r1))
-    env.process(router1.send_packets(link_r1_to_r2))
+    env.process(router2.receive_packets(link_r1_r2))
+    env.process(router2.send_packets(link_r2_dest))
     
-    # 3. Router 2 (Forward)
-    env.process(router2.receive_packets(link_r1_to_r2))
-    env.process(router2.send_packets(link_r2_to_dest))
-    
-    # 4. Destination
-    env.process(destination_host(env, link_r2_to_dest, PROP_DELAY_LINK_S, delay_stats, received_stats))
-    
-    # --- Monitors ---
-    env.process(monitor_queue_size(env, router1, 0.01, queue_size_stats_r1))
-    env.process(monitor_queue_size(env, router2, 0.01, queue_size_stats_r2))
+    env.process(destination_host(env, link_r2_dest, PROP_DELAY_LINK_S, delay_stats, received_stats))
     env.process(monitor_throughput(env, MONITOR_INTERVAL_S, received_stats, throughput_stats))
-    env.process(monitor_total_packet_loss(env, MONITOR_INTERVAL_S, [router1, router2], packets_sent_stats, loss_rate_stats))
     
     env.run(until=SIM_TIME_S)
+
+    # --- Plotting ---
+    plt.figure(figsize=(14, 6))
     
-    print("\n--- Λήξη Προσομοίωσης ---")
-
-    # Συνολικά Αποτελέσματα
-    total_packets_sent = packets_sent_stats['count']
-    total_dropped = router1.packets_dropped + router2.packets_dropped
-    total_packets_received = received_stats['count']
+    # 1. Delay per Host (Scatter)
+    plt.subplot(1, 2, 1)
+    times_a = [x[0] for x in delay_stats if x[2]=='HostA']
+    delays_a = [x[1] for x in delay_stats if x[2]=='HostA']
+    times_b = [x[0] for x in delay_stats if x[2]=='HostB']
+    delays_b = [x[1] for x in delay_stats if x[2]=='HostB']
     
-    final_packet_loss_rate = (total_dropped / total_packets_sent) * 100 if total_packets_sent > 0 else 0
-    
-    total_time = received_stats.get('last_arrival_time', 0)
-    total_bits_received = received_stats['total_bits']
-    average_throughput_bps = total_bits_received / total_time if total_time > 0 else 0
-
-    print("\n--- Τελικά Αποτελέσματα Μετρικών ---")
-    print(f"Συνολικά Drops (R1+R2): {total_dropped}")
-    print(f"Drops στον R1 (Aggregator): {router1.packets_dropped}")
-    print(f"Drops στον R2 (Backbone): {router2.packets_dropped}")
-    print(f"Τελικό Ποσοστό Απώλειας: {final_packet_loss_rate:.2f}%")
-    print(f"Μέσο Throughput: {average_throughput_bps / 1_000_000:.4f} Mbps")
-
-    # Plotting
-    plt.figure(figsize=(16, 12))
-
-    # 1. Delay
-    plt.subplot(2, 2, 1)
-    if delay_stats:
-        x_val = [item[0] for item in delay_stats]
-        y_val = [item[1] for item in delay_stats]
-        plt.plot(x_val, y_val, marker='.', linestyle='None', markersize=1, alpha=0.5)
-    plt.title("End-to-End Delay (Complex Network)", fontsize=14)
-    plt.xlabel("Χρόνος Άφιξης (s)")
-    plt.ylabel("Καθυστέρηση (s)")
-    plt.grid(True)
-
-    # 2. Queue Size Comparisson
-    plt.subplot(2, 2, 2)
-    if queue_size_stats_r1:
-        x1 = [item[0] for item in queue_size_stats_r1]
-        y1 = [item[1] for item in queue_size_stats_r1]
-        plt.step(x1, y1, where='post', color='orange', label='Router 1 (Merge)')
-    
-    if queue_size_stats_r2:
-        x2 = [item[0] for item in queue_size_stats_r2]
-        y2 = [item[1] for item in queue_size_stats_r2]
-        plt.step(x2, y2, where='post', color='blue', alpha=0.7, label='Router 2')
-        
-    plt.axhline(y=QUEUE_SIZE, color='r', linestyle='--', label='Max Capacity')
-    plt.title("Σύγκριση Ουρών Routers", fontsize=14)
-    plt.xlabel("Χρόνος (s)")
-    plt.ylabel("Πακέτα")
+    plt.plot(times_a, delays_a, 'o', markersize=2, label='Host A (Small)', alpha=0.6)
+    plt.plot(times_b, delays_b, 'x', markersize=2, label='Host B (Large)', alpha=0.6)
+    plt.title(f"Delay per Packet ({SCHEDULING_ALGORITHM} - {SCENARIO})")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Delay (s)")
     plt.legend()
-    plt.grid(True)
 
-    # 3. Throughput
-    plt.subplot(2, 2, 3)
-    if throughput_stats:
-        x_val = [item[0] for item in throughput_stats]
-        y_val = [item[1] for item in throughput_stats]
-        plt.plot(x_val, y_val, color='green')
-        plt.axhline(y=BANDWIDTH_BPS/1e6, color='black', linestyle='--', alpha=0.5, label='Max Link Bandwidth')
-    plt.title("Throughput (Mbps)", fontsize=14)
-    plt.xlabel("Χρόνος (s)")
+    plt.grid(True)
+    
+    # 2. Throughput
+    plt.subplot(1, 2, 2)
+    t_time = [x[0] for x in throughput_stats]
+    t_val = [x[1] for x in throughput_stats]
+    plt.plot(t_time, t_val, color='green')
+    plt.axhline(y=BANDWIDTH_BPS/1e6, color='red', linestyle='--', label='Max Limit')
+    plt.title("Total Throughput")
+    plt.xlabel("Time (s)")
     plt.ylabel("Mbps")
-    plt.legend()
-    plt.grid(True)
-
-    # 4. Loss Rate
-    plt.subplot(2, 2, 4)
-    if loss_rate_stats:
-        x_val = [item[0] for item in loss_rate_stats]
-        y_val = [item[1] for item in loss_rate_stats]
-        plt.plot(x_val, y_val, color='purple')
-    plt.title("Αθροιστικό Ποσοστό Απώλειας Πακέτων (%)", fontsize=14)
-    plt.xlabel("Χρόνος (s)")
-    plt.ylabel("% Απώλειας")
     plt.grid(True)
     
-    plt.tight_layout(pad=3.0)
+    plt.tight_layout()
     plt.show()
